@@ -28,10 +28,12 @@ The tool validates the following:
 ## Reports Generated
 
 ### all_switches.csv
-
 Contains the results for every switch processed.
 
 Example:
-
 ```csv
 Hostname,IP,Platform,Version,BootVariable,CPUPercent,FreeSpaceBytes,Status
+```
+
+### exceptions.csv
+Contains only switches that failed one or more validation checks.
