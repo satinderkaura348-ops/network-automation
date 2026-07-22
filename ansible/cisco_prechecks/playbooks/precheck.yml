@@ -1,0 +1,11 @@
+---
+- name: Catalyst 9300 Upgrade Prechecks
+  hosts: upgrade_candidates
+
+  gather_facts: false
+
+  vars_files:    
+    - ../group_vars/vault.yml
+
+  roles:
+    - c9300_precheck
