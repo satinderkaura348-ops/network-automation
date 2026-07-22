@@ -1,0 +1,291 @@
+---
+###############################################################################
+# SHOW VERSION
+###############################################################################
+
+- name: Collect show version
+  cisco.ios.ios_command:
+    commands:
+      - show version
+  register: version_output
+
+- name: Store version output
+  set_fact:
+    show_ver: "{{ version_output.stdout[0] }}"
+
+- name: Verify Catalyst 9300
+  assert:
+    that:
+      - "'C9300' in show_ver"
+    success_msg: "Catalyst 9300 verified"
+    fail_msg: "Device is not a Catalyst 9300"
+
+- name: Verify install mode
+  assert:
+    that:
+      - "'INSTALL' in show_ver"
+    success_msg: "Switch is running in INSTALL mode"
+    fail_msg: "Switch is running in BUNDLE mode"
+
+- name: Extract hostname
+  set_fact:
+    switch_hostname: >-
+      {{
+        show_ver
+        | regex_findall('([A-Za-z0-9._-]+) uptime is')
+        | first
+        | default(inventory_hostname)
+      }}
+
+- name: Extract platform model
+  set_fact:
+    platform_model: >-
+      {{
+        (
+          show_ver
+          | regex_findall('C9[0-9]{3}[A-Z0-9-]*')
+          | first
+          | default('UNKNOWN')
+        )
+      }}
+
+- name: Extract running IOS version
+  set_fact:
+    running_version: >-
+      {{
+        show_ver
+        | regex_findall('Cisco IOS XE Software, Version ([0-9.]+)')
+        | first
+        | default('UNKNOWN')
+      }}
+
+
+
+
+###############################################################################
+# FLASH CHECKS
+###############################################################################
+
+- name: Get flash contents
+  cisco.ios.ios_command:
+    commands:
+      - "dir flash:"
+  register: flash_output
+
+- name: Store flash output
+  set_fact:
+    flash_dir: "{{ flash_output.stdout[0] }}"
+
+- name: Verify packages.conf exists
+  assert:
+    that:
+      - "'packages.conf' in flash_dir"
+    success_msg: "packages.conf found"
+    fail_msg: "packages.conf missing"
+
+- name: Extract free flash space
+  set_fact:
+    free_space: "{{ (flash_dir | regex_findall('([0-9]+) bytes free') | first | default('0')) | int }}"
+
+- name: Display free flash space
+  debug:
+    msg: "Free flash space: {{ free_space }} bytes"
+
+- name: Verify free flash space
+  assert:
+    that:
+      - (free_space | int) > (minimum_flash_space | int)
+    success_msg: "Sufficient flash space available"
+    fail_msg: >-
+      Insufficient flash space.
+      Available: {{ free_space }}
+      Required: {{ minimum_flash_space }}
+
+
+
+###############################################################################
+# STACK HEALTH
+###############################################################################
+
+- name: Get stack status
+  cisco.ios.ios_command:
+    commands:
+      - show switch
+  register: stack_output
+
+- name: Store stack output
+  set_fact:
+    stack_info: "{{ stack_output.stdout[0] }}"
+
+- name: Verify stack health
+  assert:
+    that:
+      - "'Provisioned' not in stack_info"
+      - "'Init' not in stack_info"
+      - "'Removed' not in stack_info"
+      - "'Recovering' not in stack_info"
+    success_msg: "All stack members healthy"
+    fail_msg: "One or more stack members are unhealthy"
+
+###############################################################################
+# BOOT VARIABLE
+###############################################################################
+
+- name: Get boot configuration
+  cisco.ios.ios_command:
+    commands:
+      - show boot system
+  register: boot_output
+
+- name: Store boot output
+  set_fact:
+    boot_info: "{{ boot_output.stdout[0] }}"
+
+- name: Check boot variable points to packages.conf
+  set_fact:
+    boot_variable_valid: "{{ 'flash:packages.conf' in boot_info }}"
+
+- name: Check for secondary boot path
+  set_fact:
+    secondary_boot_exists: >-
+      {{
+        (
+          boot_info | regex_findall('flash:[^ \n;,]+')
+        ) | length > 1
+      }}
+
+- name: Determine boot variable status
+  set_fact:
+    boot_variable_status: >-
+      {{
+        'FAIL'
+        if (not boot_variable_valid or secondary_boot_exists)
+        else 'PASS'
+      }}
+
+###############################################################################
+# CPU CHECK
+###############################################################################
+
+- name: Collect CPU utilisation
+  cisco.ios.ios_command:
+    commands:
+      - show processes cpu | include CPU
+  register: cpu_output
+
+- name: Extract CPU percentage
+  set_fact:
+    cpu_usage: "{{ (cpu_output.stdout[0] | regex_findall('five seconds: ([0-9]+)%') | first | default('0')) | int }}"
+
+- name: Display CPU utilisation
+  debug:
+    msg: "CPU Usage: {{ cpu_usage }}%"
+
+- name: Verify CPU threshold
+  assert:
+    that:
+      - (cpu_usage | int) < (cpu_threshold | int)
+    success_msg: "CPU utilisation within limits"
+    fail_msg: "CPU utilisation exceeds threshold"
+
+###############################################################################
+# ISSUES
+###############################################################################
+
+- name: Initialize issues list
+  set_fact:
+    issues: []
+
+
+- name: Add boot path warning
+  set_fact:
+    issues: "{{ issues + ['Secondary boot path configured'] }}"
+  when: secondary_boot_exists
+
+- name: Add CPU warning
+  set_fact:
+    issues: "{{ issues + ['CPU exceeds threshold'] }}"
+  when: cpu_usage | int > cpu_threshold | int
+
+###############################################################################
+# OVERALL STATUS
+###############################################################################
+
+- name: Determine overall status
+  set_fact:
+    overall_status: >-
+      {{
+        'FAIL'
+        if (
+          boot_variable_status == 'FAIL'
+          or (cpu_usage | int) > (cpu_threshold | int)
+        )
+        else 'PASS'
+      }}
+
+###############################################################################
+# FINAL REPORT
+###############################################################################
+
+- name: Build final report
+  set_fact:
+    precheck_report:
+      hostname: "{{ switch_hostname }}"
+      platform: "{{ platform_model }}"
+      running_version: "{{ running_version }}"
+
+      checks:
+        install_mode: "PASS"
+        stack_health: "PASS"
+        boot_variable: "{{ boot_variable_status }}"
+        cpu_usage_percent: "{{ cpu_usage }}"
+
+      flash:
+        free_space_bytes: "{{ free_space }}"
+        
+
+      overall_status: "{{ overall_status }}"
+      issues: "{{ issues }}"
+
+- name: Display final report
+  debug:
+    var: precheck_report
+
+- name: Build exception reason
+  set_fact:
+    exception_reason: >-
+      {{
+        (issues | join('; '))
+        if issues | length > 0
+        else 'N/A'
+      }}
+
+- name: Append exception to CSV
+  lineinfile:
+    path: "/home/s16singh/ansible/prechecks_project/reports/exceptions.csv"
+    create: yes
+    line: "{{ switch_hostname }},{{ inventory_hostname }},{{ overall_status }},{{ exception_reason }}"
+  delegate_to: localhost
+  when: overall_status != "PASS"
+
+- name: Save all switch results
+  lineinfile:
+    path: "/home/s16singh/ansible/prechecks_project/reports/all_switches.csv"
+    create: yes
+    line: >-
+      {{ switch_hostname }},
+      {{ inventory_hostname }},
+      {{ platform_model }},
+      {{ running_version }},
+      {{ boot_variable_status }},
+      {{ cpu_usage }},
+      {{ free_space }},
+      {{ overall_status }}
+  delegate_to: localhost
+
+- name: Update progress
+  lineinfile:
+    path: "/home/s16singh/ansible/prechecks_project/reports/progress.txt"
+    create: yes
+    line: "{{ inventory_hostname }}"
+  delegate_to: localhost
